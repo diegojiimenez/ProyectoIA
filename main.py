@@ -951,6 +951,339 @@ def compute_heart_features(symbol_binary):
     }
 
 # =========================================================
+# Clover/Trebol features (NUEVO - mejorado)
+# =========================================================
+def compute_clover_features(symbol_binary):
+    """
+    Características específicas de trébol:
+    - Tres lóbulos redondeados en la parte superior
+    - Base/tallo estrecho en la parte inferior
+    - Múltiples defectos de convexidad (entrantes entre lóbulos)
+    - Circularity moderada (no tan alta como corazón)
+    - Aspect ratio cercano a 1
+    """
+    h, w = symbol_binary.shape
+    if h < 8 or w < 8:
+        return {
+            "lobe_count": 0,
+            "base_narrowness": 0.0,
+            "top_bottom_complexity": 0.0,
+            "convexity_defects_score": 0.0,
+            "clover_feature_score": 0.0
+        }
+    
+    # Normalizar a tamaño estándar
+    H0, W0 = 64, 64
+    norm = cv2.resize(symbol_binary, (W0, W0), interpolation=cv2.INTER_AREA)
+    
+    # Aplicar morfología
+    kernel = np.ones((2, 2), np.uint8)
+    norm = cv2.morphologyEx(norm, cv2.MORPH_CLOSE, kernel)
+    
+    # Dividir en regiones (superior y inferior)
+    split_point = int(H0 * 0.65)  # 65% superior = lóbulos, 35% inferior = tallo
+    top_region = norm[:split_point, :]
+    bottom_region = norm[split_point:, :]
+    
+    # === ANÁLISIS DE LA PARTE SUPERIOR (Lóbulos) ===
+    top_projection = top_region.sum(axis=0).astype(np.float32)
+    
+    # Suavizado
+    if SCIPY_AVAILABLE:
+        top_smooth = ndi.gaussian_filter1d(top_projection, sigma=2.0)
+    else:
+        kernel_smooth = np.ones(5) / 5.0
+        top_smooth = np.convolve(top_projection, kernel_smooth, mode='same')
+    
+    # Detectar picos (lóbulos)
+    peaks = []
+    for i in range(3, len(top_smooth) - 3):
+        if (top_smooth[i] > top_smooth[i-1] and top_smooth[i] > top_smooth[i+1] and
+            top_smooth[i] > top_smooth[i-2] and top_smooth[i] > top_smooth[i+2] and
+            top_smooth[i] > top_smooth[i-3] and top_smooth[i] > top_smooth[i+3]):
+            peaks.append(i)
+    
+    # Filtrar picos por altura mínima
+    threshold_peak = 0.25 * top_smooth.max() if top_smooth.max() > 0 else 0
+    significant_peaks = [p for p in peaks if top_smooth[p] >= threshold_peak]
+    
+    # Filtrar picos muy cercanos
+    filtered_peaks = []
+    min_distance = W0 // 6
+    for peak in significant_peaks:
+        if not filtered_peaks or abs(peak - filtered_peaks[-1]) > min_distance:
+            filtered_peaks.append(peak)
+    
+    lobe_count = len(filtered_peaks)
+    
+    # === ANÁLISIS DE LA PARTE INFERIOR (Base/Tallo) ===
+    bottom_projection = bottom_region.sum(axis=0).astype(np.float32)
+    
+    # Calcular ancho activo de la base
+    bottom_active = np.where(bottom_projection > 0.15 * (bottom_projection.max() + 1e-6))[0]
+    bottom_width = bottom_active[-1] - bottom_active[0] + 1 if len(bottom_active) > 0 else W0
+    
+    # Calcular ancho activo de la parte superior
+    top_active = np.where(top_smooth > 0.15 * (top_smooth.max() + 1e-6))[0]
+    top_width = top_active[-1] - top_active[0] + 1 if len(top_active) > 0 else W0
+    
+    # Ratio de estrechamiento (el trébol se estrecha abajo)
+    base_narrowness = 1.0 - (bottom_width / (top_width + 1e-6))
+    base_narrowness = max(0, min(1, base_narrowness))  # Clamp 0-1
+    
+    # === COMPLEJIDAD SUPERIOR vs INFERIOR ===
+    # El trébol tiene más complejidad arriba (lóbulos) que abajo (tallo)
+    
+    # Varianza de la proyección superior (más picos = más varianza)
+    top_variance = np.var(top_smooth)
+    bottom_variance = np.var(bottom_projection)
+    
+    complexity_ratio = top_variance / (bottom_variance + 1e-6)
+    top_bottom_complexity = min(complexity_ratio / 3.0, 1.0)  # Normalizar
+    
+    # === DEFECTOS DE CONVEXIDAD ===
+    contours, _ = find_contours(norm)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        
+        # Contar defectos de convexidad (entrantes entre lóbulos)
+        defects_count = 0
+        if len(c) >= 5:  # Necesita al menos 5 puntos
+            hull_indices = cv2.convexHull(c, returnPoints=False)
+            if hull_indices is not None and len(hull_indices) >= 4:
+                defects = cv2.convexityDefects(c, hull_indices)
+                if defects is not None:
+                    for d in defects:
+                        depth = d[0][3] / 256.0
+                        if depth > 3:  # Umbral para defectos significativos
+                            defects_count += 1
+        
+        # El trébol debería tener 2-4 defectos (entrantes entre los 3 lóbulos)
+        if defects_count >= 2 and defects_count <= 5:
+            convexity_defects_score = 1.0
+        elif defects_count == 1 or defects_count == 6:
+            convexity_defects_score = 0.6
+        else:
+            convexity_defects_score = 0.2
+    else:
+        convexity_defects_score = 0.0
+    
+    # === SCORE COMPUESTO ===
+    score = 0.0
+    
+    # Conteo de lóbulos (ideal: 3)
+    if lobe_count == 3:
+        score += 0.35
+    elif lobe_count == 2:
+        score += 0.20
+    elif lobe_count == 4:
+        score += 0.15
+    else:
+        score += 0.05
+    
+    # Base estrecha (característica distintiva del trébol)
+    score += 0.25 * base_narrowness
+    
+    # Complejidad superior vs inferior
+    score += 0.20 * top_bottom_complexity
+    
+    # Defectos de convexidad
+    score += 0.20 * convexity_defects_score
+    
+    clover_feature_score = min(score, 1.0)
+    
+    return {
+        "lobe_count": lobe_count,
+        "base_narrowness": base_narrowness,
+        "top_bottom_complexity": top_bottom_complexity,
+        "convexity_defects_score": convexity_defects_score,
+        "clover_feature_score": clover_feature_score
+    }
+
+# =========================================================
+# Spade/Pica features (NUEVO)
+# =========================================================
+def compute_spade_features(symbol_binary):
+    """
+    Características específicas de pica (spade):
+    - Punta aguda superior (concentración de píxeles en la parte superior central)
+    - Curvas laterales simétricas (lóbulos redondeados en los lados)
+    - Base/tallo estrecho similar al trébol pero con diferente estructura superior
+    - Aspect ratio vertical (más alto que ancho, típicamente 1.1-1.4)
+    - Simetría bilateral alta
+    """
+    h, w = symbol_binary.shape
+    if h < 8 or w < 8:
+        return {
+            "peak_sharpness": 0.0,
+            "vertical_aspect": 0.0,
+            "lateral_symmetry": 0.0,
+            "base_narrowness": 0.0,
+            "top_concentration": 0.0,
+            "spade_feature_score": 0.0
+        }
+    
+    # Normalizar a tamaño estándar
+    H0, W0 = 64, 64
+    norm = cv2.resize(symbol_binary, (W0, W0), interpolation=cv2.INTER_AREA)
+    
+    # Aplicar morfología para mejorar forma
+    kernel = np.ones((2, 2), np.uint8)
+    norm = cv2.morphologyEx(norm, cv2.MORPH_CLOSE, kernel)
+    
+    # === 1. DETECCIÓN DE PUNTA AGUDA SUPERIOR ===
+    # Dividir en tercios verticales
+    top_third = int(H0 * 0.33)
+    top_region = norm[:top_third, :]
+    
+    # Proyección vertical en la región superior
+    top_projection = top_region.sum(axis=1).astype(np.float32)
+    
+    # Buscar el pico más alto (debería estar en la parte superior)
+    if top_projection.max() > 0:
+        peak_row = np.argmax(top_projection)
+        # La agudeza se mide por qué tan rápido decae el valor desde el pico
+        if peak_row < len(top_projection) - 5:
+            # Calcular la pendiente de caída
+            decay_values = top_projection[peak_row:peak_row+5]
+            if len(decay_values) > 1 and decay_values[0] > 0:
+                decay_rate = (decay_values[0] - decay_values[-1]) / (decay_values[0] + 1e-6)
+                peak_sharpness = min(decay_rate / 0.5, 1.0)  # Normalizar
+            else:
+                peak_sharpness = 0.0
+        else:
+            peak_sharpness = 0.0
+    else:
+        peak_sharpness = 0.0
+    
+    # Proyección horizontal en la región superior para detectar concentración central
+    top_horizontal = top_region.sum(axis=0).astype(np.float32)
+    
+    # Suavizado
+    if SCIPY_AVAILABLE:
+        top_h_smooth = ndi.gaussian_filter1d(top_horizontal, sigma=1.5)
+    else:
+        kernel_smooth = np.ones(3) / 3.0
+        top_h_smooth = np.convolve(top_horizontal, kernel_smooth, mode='same')
+    
+    # Calcular concentración en el centro (tercio central)
+    center_start = W0 // 3
+    center_end = 2 * W0 // 3
+    center_sum = np.sum(top_h_smooth[center_start:center_end])
+    total_sum = np.sum(top_h_smooth) + 1e-6
+    top_concentration = center_sum / total_sum
+    
+    # === 2. ASPECT RATIO VERTICAL ===
+    # Las picas son más altas que anchas
+    contours, _ = find_contours(norm)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        x, y, wc, hc = cv2.boundingRect(c)
+        aspect_ratio = hc / (wc + 1e-6)
+        
+        # Picas típicamente tienen aspect ratio entre 1.1 y 1.4
+        if 1.1 <= aspect_ratio <= 1.4:
+            vertical_aspect = 1.0
+        elif 1.0 <= aspect_ratio <= 1.5:
+            # Dar score parcial si está cerca del rango
+            vertical_aspect = 0.7
+        else:
+            vertical_aspect = 0.3
+    else:
+        vertical_aspect = 0.0
+    
+    # === 3. SIMETRÍA LATERAL ===
+    # Las picas son muy simétricas lateralmente
+    mid_col = W0 // 2
+    left_half = norm[:, :mid_col]
+    right_half = norm[:, mid_col:]
+    
+    # Reflejar la mitad derecha
+    right_flipped = np.flip(right_half, axis=1)
+    
+    # Asegurar mismo tamaño
+    min_width = min(left_half.shape[1], right_flipped.shape[1])
+    left_half = left_half[:, :min_width]
+    right_flipped = right_flipped[:, :min_width]
+    
+    # Normalizar
+    left_norm = left_half.astype(np.float32)
+    right_norm = right_flipped.astype(np.float32)
+    
+    if left_norm.max() > 0:
+        left_norm = left_norm / left_norm.max()
+    if right_norm.max() > 0:
+        right_norm = right_norm / right_norm.max()
+    
+    # Calcular similitud
+    l_vec = left_norm.flatten()
+    r_vec = right_norm.flatten()
+    l_vec /= (np.linalg.norm(l_vec) + 1e-6)
+    r_vec /= (np.linalg.norm(r_vec) + 1e-6)
+    lateral_symmetry = float(np.dot(l_vec, r_vec))
+    
+    # === 4. BASE ESTRECHA ===
+    # Similar al trébol, las picas tienen una base estrecha
+    bottom_third = int(H0 * 0.67)
+    bottom_region = norm[bottom_third:, :]
+    
+    bottom_projection = bottom_region.sum(axis=0).astype(np.float32)
+    
+    # Calcular ancho activo de la base
+    bottom_active = np.where(bottom_projection > 0.15 * (bottom_projection.max() + 1e-6))[0]
+    bottom_width = bottom_active[-1] - bottom_active[0] + 1 if len(bottom_active) > 0 else W0
+    
+    # Calcular ancho en la región media (donde están las curvas laterales)
+    middle_start = int(H0 * 0.33)
+    middle_end = int(H0 * 0.67)
+    middle_region = norm[middle_start:middle_end, :]
+    middle_projection = middle_region.sum(axis=0).astype(np.float32)
+    
+    middle_active = np.where(middle_projection > 0.15 * (middle_projection.max() + 1e-6))[0]
+    middle_width = middle_active[-1] - middle_active[0] + 1 if len(middle_active) > 0 else W0
+    
+    # Ratio de estrechamiento (base más estrecha que el medio)
+    base_narrowness = 1.0 - (bottom_width / (middle_width + 1e-6))
+    base_narrowness = max(0, min(1, base_narrowness))  # Clamp 0-1
+    
+    # === SCORE COMPUESTO ===
+    score = 0.0
+    
+    # Punta aguda (característica MUY distintiva de la pica)
+    score += 0.30 * peak_sharpness
+    
+    # Aspect ratio vertical
+    score += 0.20 * vertical_aspect
+    
+    # Simetría lateral (las picas son muy simétricas)
+    if lateral_symmetry > 0.85:
+        score += 0.25
+    elif lateral_symmetry > 0.75:
+        score += 0.15
+    else:
+        score += 0.05
+    
+    # Base estrecha
+    score += 0.15 * base_narrowness
+    
+    # Concentración superior central
+    if top_concentration > 0.45:
+        score += 0.10
+    elif top_concentration > 0.35:
+        score += 0.05
+    
+    spade_feature_score = min(score, 1.0)
+    
+    return {
+        "peak_sharpness": peak_sharpness,
+        "vertical_aspect": vertical_aspect,
+        "lateral_symmetry": lateral_symmetry,
+        "base_narrowness": base_narrowness,
+        "top_concentration": top_concentration,
+        "spade_feature_score": spade_feature_score
+    }
+
+# =========================================================
 # Diamond features (nuevo)
 # =========================================================
 def compute_diamond_features(symbol_binary):
@@ -1253,6 +1586,8 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
     shape = compute_shape_metrics(suit_symbol_binary)
     heart_feats = compute_heart_features(suit_symbol_binary)
     diamond_feats = compute_diamond_features(suit_symbol_binary)
+    clover_feats = compute_clover_features(suit_symbol_binary)  # NUEVO
+    spade_feats = compute_spade_features(suit_symbol_binary)  # NUEVO
 
     # Re-segmentación si degenerado
     degenerate_fix_applied = False
@@ -1265,6 +1600,8 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
             shape = compute_shape_metrics(suit_symbol_binary)
             heart_feats = compute_heart_features(suit_symbol_binary)
             diamond_feats = compute_diamond_features(suit_symbol_binary)
+            clover_feats = compute_clover_features(suit_symbol_binary)  # NUEVO
+            spade_feats = compute_spade_features(suit_symbol_binary)  # NUEVO
 
     red_flag = color_stats["is_red"]
     color_group = "red" if red_flag else "black"
@@ -1292,6 +1629,8 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
     per_suit_scores = {}
     strong_template_diamond = (best_name_template == "Diamantes" and template_score >= 0.88)
     strong_template_heart   = (best_name_template == "Corazones" and template_score >= 0.88)
+    strong_template_clover  = (best_name_template == "Treboles" and template_score >= 0.85)  # NUEVO
+    strong_template_spade   = (best_name_template == "Picas" and template_score >= 0.85)     # NUEVO
 
     for suit in candidate_suits:
         base = template_score if best_name_template == suit else template_score * 0.85
@@ -1302,55 +1641,132 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
             if suit == "Diamantes":
                 df = diamond_feats["diamond_feature_score"]
                 heur += df * 0.70
-                if diamond_feats["approx_vertices"] in [4,5]: heur += 0.08
-                if diamond_feats["aspect_ratio_ok"]: heur += 0.05
-                if diamond_feats["radial_uniformity"] > 0.6: heur += 0.04
-                if diamond_feats["angle_uniformity"] > 0.6: heur += 0.04
-                if diamond_feats["orientation_score"] > 0.5: heur += 0.04
-                # penalización si corazón fuerte
+                if diamond_feats["approx_vertices"] in [4,5]: 
+                    heur += 0.08
+                if diamond_feats["aspect_ratio_ok"]: 
+                    heur += 0.05
+                if diamond_feats["radial_uniformity"] > 0.6: 
+                    heur += 0.04
+                if diamond_feats["angle_uniformity"] > 0.6: 
+                    heur += 0.04
+                if diamond_feats["orientation_score"] > 0.5: 
+                    heur += 0.04
+                
+                # Penalización si corazón fuerte
                 if heart_feats["heart_lobes_score"] > 0.55:
                     heur -= 0.10
+                
                 if suit in proto_dist:
                     heur += 0.10 * proto_dist[suit]
                 if strong_template_diamond:
                     heur += 0.06
+                    
             # Corazones
-            if suit == "Corazones":
+            elif suit == "Corazones":
                 lobes = heart_feats["heart_lobes_score"]
                 heur += lobes * 0.80
-                if heart_feats["peak_count"] >= 2: heur += 0.10
-                if heart_feats["top_bottom_ratio"] > 1.05: heur += 0.06
-                if heart_feats["symmetry"] > 0.85: heur += 0.06
+                if heart_feats["peak_count"] >= 2: 
+                    heur += 0.10
+                if heart_feats["top_bottom_ratio"] > 1.05: 
+                    heur += 0.06
+                if heart_feats["symmetry"] > 0.85: 
+                    heur += 0.06
+                
+                # Penalización si diamante fuerte
                 if diamond_feats["diamond_feature_score"] > 0.50:
-                    heur -= 0.08  # diamante fuerte reduce corazón
+                    heur -= 0.08
+                
                 if suit in proto_dist:
                     heur += 0.12 * proto_dist[suit]
                 if strong_template_heart:
                     heur += 0.06
-        else:
-            # Negro (sin cambios mayores)
+                    
+        else:  # Negro (Picas y Treboles)
+            # === PICAS ===
             if suit == "Picas":
-                if shape["aspect_ratio"] > 1.05: heur += 0.25
-                if shape["defects"] <= 2: heur += 0.15
-                if shape["circularity"] < 0.70: heur += 0.08
-                if shape["solidity"] < 0.90: heur += 0.06
-            if suit == "Treboles":
-                if shape["defects"] >= 2: heur += 0.25
-                if 0.85 <= shape["aspect_ratio"] <= 1.15: heur += 0.12
-                if shape["circularity"] >= 0.65: heur += 0.12
-                if shape["solidity"] >= 0.90: heur += 0.08
+                # Características distintivas de pica
+                sp = spade_feats["spade_feature_score"]
+                heur += sp * 0.75  # Peso fuerte a spade_feature_score
+                
+                # Bonificaciones por características específicas
+                if spade_feats["peak_sharpness"] > 0.5:
+                    heur += 0.10
+                if spade_feats["vertical_aspect"] > 0.5:
+                    heur += 0.08
+                if spade_feats["lateral_symmetry"] > 0.8:
+                    heur += 0.06
+                if spade_feats["base_narrowness"] > 0.3:
+                    heur += 0.05
+                
+                # PENALIZACIÓN si tiene características de trébol
+                if clover_feats["clover_feature_score"] > 0.45:
+                    heur -= 0.15
+                if clover_feats["lobe_count"] == 3:
+                    heur -= 0.10
+                if clover_feats["base_narrowness"] > 0.3:
+                    heur -= 0.08
+                
+                if strong_template_spade:
+                    heur += 0.08
+                    
+            # === TREBOLES ===
+            elif suit == "Treboles":
+                # NUEVO: Usar características específicas de trébol
+                cf = clover_feats["clover_feature_score"]
+                heur += cf * 0.75  # Peso fuerte a clover_feature_score
+                
+                # Bonificaciones por características específicas
+                if clover_feats["lobe_count"] == 3:
+                    heur += 0.12  # Bonus por 3 lóbulos exactos
+                elif clover_feats["lobe_count"] == 2:
+                    heur += 0.06  # Bonus menor por 2 lóbulos
+                
+                if clover_feats["base_narrowness"] > 0.25:
+                    heur += 0.08  # Bonus por base estrecha
+                
+                if clover_feats["top_bottom_complexity"] > 0.4:
+                    heur += 0.06  # Bonus por complejidad superior
+                
+                if clover_feats["convexity_defects_score"] > 0.6:
+                    heur += 0.06  # Bonus por defectos de convexidad
+                
+                # Características de forma general
+                if 0.85 <= shape["aspect_ratio"] <= 1.15:  # Aspect ratio cercano a 1
+                    heur += 0.08
+                if shape["defects"] >= 2:  # Al menos 2 defectos
+                    heur += 0.10
+                if shape["circularity"] >= 0.60:  # Cierta circularidad
+                    heur += 0.06
+                if shape["solidity"] >= 0.85:  # Buena solidez
+                    heur += 0.05
+                
+                # PENALIZACIÓN si tiene características de diamante
+                if diamond_feats["diamond_feature_score"] > 0.50:
+                    heur -= 0.15  # Penalización fuerte
+                if diamond_feats["approx_vertices"] == 4:
+                    heur -= 0.10
+                if diamond_feats["radial_uniformity"] > 0.7:
+                    heur -= 0.08
+                
+                if strong_template_clover:
+                    heur += 0.10  # Bonus mayor por template fuerte
 
-        # Ajuste si degenerado pero template Diamantes fuerte
-        if degenerate_fix_applied and strong_template_diamond and suit == "Diamantes":
-            heur += 0.10
-            base += 0.05
+        # Ajuste si degenerado pero template fuerte
+        if degenerate_fix_applied:
+            if strong_template_diamond and suit == "Diamantes":
+                heur += 0.10
+                base += 0.05
+            elif strong_template_clover and suit == "Treboles":
+                heur += 0.12  # Bonus mayor para tréboles
+                base += 0.06
 
         final_score = base + heur
         per_suit_scores[suit] = {"base": base, "heur": heur, "final": final_score}
 
     chosen = max(per_suit_scores.items(), key=lambda x: x[1]["final"])[0]
     final_score = per_suit_scores[chosen]["final"]
-    if final_score > 1.0: final_score = 1.0
+    if final_score > 1.0: 
+        final_score = 1.0
 
     debug_info = {
         "template_name": best_name_template,
@@ -1361,17 +1777,37 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
         "shape": shape,
         "heart_features": heart_feats,
         "diamond_features": diamond_feats,
+        "clover_features": clover_feats,  # NUEVO
+        "spade_features": spade_feats,  # NUEVO
         "per_suit_scores": per_suit_scores,
         "proto_similarity": proto_dist,
         "degenerate_fix_applied": degenerate_fix_applied
     }
 
-    # Overrides para diamantes (template fuerte + diamond_feature_score)
+    # === OVERRIDES MEJORADOS ===
+    
+    # Override para Diamantes
     if strong_template_diamond and diamond_feats["diamond_feature_score"] >= 0.45 and chosen != "Diamantes":
-        if heart_feats["heart_lobes_score"] < 0.70:  # no corazón extremadamente fuerte
+        if heart_feats["heart_lobes_score"] < 0.70:
             debug_info["override"] = "Forzado Diamantes por template + diamond_feature_score"
             chosen = "Diamantes"
             final_score = max(final_score, 0.80)
+    
+    # Override para Treboles (NUEVO)
+    if color_group == "black":
+        # Si el template dice Treboles y tiene buenas características de trébol
+        if strong_template_clover and clover_feats["clover_feature_score"] >= 0.40 and chosen != "Treboles":
+            if diamond_feats["diamond_feature_score"] < 0.60:  # No es claramente diamante
+                debug_info["override"] = "Forzado Treboles por template + clover_feature_score"
+                chosen = "Treboles"
+                final_score = max(final_score, 0.75)
+        
+        # Si tiene características MUY fuertes de trébol, forzar
+        if clover_feats["clover_feature_score"] >= 0.65 and clover_feats["lobe_count"] == 3:
+            if chosen != "Treboles":
+                debug_info["override"] = "Forzado Treboles por características muy fuertes (3 lóbulos)"
+                chosen = "Treboles"
+                final_score = max(final_score, 0.80)
 
     return chosen, final_score, debug_info
 
@@ -1442,6 +1878,8 @@ def interactive_process_and_classify(image_path, rank_templates, suit_templates,
         shape = suit_debug.get("shape", {})
         heartf = suit_debug.get("heart_features", {})
         diamondf = suit_debug.get("diamond_features", {})
+        cloverf = suit_debug.get("clover_features", {})  # NUEVO
+        spadef = suit_debug.get("spade_features", {})  # NUEVO
         color_stats = suit_debug.get("color_stats", {})
         proto_sim = suit_debug.get("proto_similarity", {})
         print("DEBUG SUIT → Template:", suit_debug.get("template_name"),
@@ -1456,6 +1894,13 @@ def interactive_process_and_classify(image_path, rank_templates, suit_templates,
         print(f"  Diamante: diamond_score={diamondf.get('diamond_feature_score',0):.3f} "
               f"approx_vertices={diamondf.get('approx_vertices')} radial_uni={diamondf.get('radial_uniformity',0):.3f} "
               f"angle_uni={diamondf.get('angle_uniformity',0):.3f} orient_score={diamondf.get('orientation_score',0):.3f}")
+        print(f"  Trébol: clover_score={cloverf.get('clover_feature_score',0):.3f} "  # NUEVO
+              f"lobe_count={cloverf.get('lobe_count')} base_narrow={cloverf.get('base_narrowness',0):.3f} "
+              f"complexity={cloverf.get('top_bottom_complexity',0):.3f} defects_score={cloverf.get('convexity_defects_score',0):.3f}")
+        print(f"  Pica: spade_score={spadef.get('spade_feature_score',0):.3f} "  # NUEVO
+              f"peak_sharpness={spadef.get('peak_sharpness',0):.3f} vertical_aspect={spadef.get('vertical_aspect',0):.3f} "
+              f"lateral_symmetry={spadef.get('lateral_symmetry',0):.3f} base_narrowness={spadef.get('base_narrowness',0):.3f} "
+              f"top_concentration={spadef.get('top_concentration',0):.3f}")
         if proto_sim:
             print("  Similitud prototipos:", proto_sim)
         if "override" in suit_debug:
