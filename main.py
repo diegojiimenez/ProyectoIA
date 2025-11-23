@@ -248,20 +248,44 @@ def extract_top_left_corner(warped_card, w_ratio=0.28, h_ratio=0.40):
 
 def extract_symbols_from_corner(corner_rgb, min_area=50, horizontal_gap=20):
     """
-    Extrae símbolos de la esquina con mejor manejo de tamaños variables
+    Extrae símbolos de la esquina con mejor manejo de tamaños variables y múltiples umbrales
     """
     gray = cv2.cvtColor(corner_rgb, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape
     
     # Ajustar el área mínima basándose en el tamaño de la esquina
-    adaptive_min_area = max(min_area, (h * w) // 200)  # Área mínima adaptativa
+    adaptive_min_area = max(min_area, (h * w) // 200)
     
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Probar múltiples métodos de umbralización para mayor robustez
+    thresholds = []
     
-    # Aplicar un ligero filtro de mediana para reducir ruido
-    thresh = cv2.medianBlur(thresh, 3)
+    # 1. Otsu básico
+    _, thresh1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    thresholds.append(thresh1)
     
-    contours, _ = find_contours(thresh)
+    # 2. Umbral adaptativo Gaussian
+    thresh2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, 11, 2)
+    thresholds.append(thresh2)
+    
+    # 3. Umbral adaptativo Mean
+    thresh3 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                     cv2.THRESH_BINARY_INV, 11, 2)
+    thresholds.append(thresh3)
+    
+    # Combinar resultados de múltiples umbrales
+    combined_thresh = np.zeros_like(gray)
+    for t in thresholds:
+        combined_thresh = cv2.bitwise_or(combined_thresh, t)
+    
+    # Aplicar filtro de mediana para reducir ruido
+    combined_thresh = cv2.medianBlur(combined_thresh, 3)
+    
+    # Aplicar operaciones morfológicas para mejorar la calidad
+    kernel_small = np.ones((2,2), np.uint8)
+    combined_thresh = cv2.morphologyEx(combined_thresh, cv2.MORPH_CLOSE, kernel_small)
+    
+    contours, _ = find_contours(combined_thresh)
     boxes = []
     
     for c in contours:
@@ -274,18 +298,19 @@ def extract_symbols_from_corner(corner_rgb, min_area=50, horizontal_gap=20):
         # Filtrar cajas demasiado pequeñas o con proporciones extrañas
         if w_box < 5 or h_box < 5:
             continue
-        if w_box / h_box > 5 or h_box / w_box > 8:  # Filtrar proporciones muy extremas
+        if w_box / h_box > 5 or h_box / w_box > 8:
             continue
             
         boxes.append([x, y, x+w_box, y+h_box])
     
     if not boxes:
-        return thresh, []
+        # Si no encontramos nada, usar solo el mejor threshold
+        return combined_thresh, []
     
-    # Ordenar por posición (arriba a abajo, izquierda a derecha)
+    # Ordenar por posición
     boxes.sort(key=lambda b: (b[1], b[0]))
     
-    # Fusionar cajas que estén muy cerca horizontalmente
+    # Fusionar cajas cercanas
     merged = []
     for box in boxes:
         x1, y1, x2, y2 = box
@@ -293,78 +318,140 @@ def extract_symbols_from_corner(corner_rgb, min_area=50, horizontal_gap=20):
             merged.append([x1, y1, x2, y2])
         else:
             mx1, my1, mx2, my2 = merged[-1]
-            # Si están en la misma fila horizontal y cerca
             if abs(y1 - my1) < 25 and (x1 - mx2) < horizontal_gap:
                 merged[-1] = [min(mx1, x1), min(my1, y1), max(mx2, x2), max(my2, y2)]
             else:
                 merged.append([x1, y1, x2, y2])
     
-    # Ordenar las cajas fusionadas
     merged.sort(key=lambda b: (b[1], b[0]))
     
-    # Extraer los símbolos con un poco de padding
+    # Extraer símbolos
     symbols = []
     for (x1, y1, x2, y2) in merged:
-        # Añadir padding pero sin salir de la imagen
-        pad = 2
+        pad = 3  # Más padding para capturar mejor los símbolos
         x1_pad = max(0, x1 - pad)
         y1_pad = max(0, y1 - pad)
         x2_pad = min(w, x2 + pad)
         y2_pad = min(h, y2 + pad)
         
-        crop = thresh[y1_pad:y2_pad, x1_pad:x2_pad]
+        crop = combined_thresh[y1_pad:y2_pad, x1_pad:x2_pad]
         
-        # Solo añadir si tiene tamaño suficiente
         if crop.shape[0] > 5 and crop.shape[1] > 5:
-            symbols.append(crop)
+            # Limpiar el símbolo extraído
+            crop_clean = cv2.morphologyEx(crop, cv2.MORPH_OPEN, kernel_small)
+            symbols.append(crop_clean)
     
     print(f"Símbolos extraídos: {len(symbols)} de esquina {w}x{h}")
     
-    return thresh, symbols
+    return combined_thresh, symbols
 
-# =========================================================
-# Multi-template scoring
-# =========================================================
 def multi_template_scores(symbol_img, templates_list):
+    """
+    Mejorado con más robustez para condiciones de cámara en vivo
+    """
     if symbol_img is None or len(templates_list) == 0:
         return 0.0, {}
-    H0,W0 = 32,32
-    symbol_norm = cv2.resize(symbol_img, (W0,W0))
-    symbol_edges = cv2.Canny(symbol_norm, 50,150)
+    
+    H0, W0 = 32, 32
+    
+    # Normalizar el símbolo de entrada
+    symbol_norm = cv2.resize(symbol_img, (W0, W0))
+    
+    # Mejorar contraste
+    symbol_norm = cv2.equalizeHist(symbol_norm)
+    
+    # Calcular características del símbolo
+    symbol_edges = cv2.Canny(symbol_norm, 30, 150)  # Umbrales más bajos para mejor detección
     symbol_inv = cv2.bitwise_not(symbol_norm)
     dist_symbol = cv2.distanceTransform(symbol_inv, cv2.DIST_L2, 3)
+    
     vec_symbol = symbol_norm.flatten().astype(np.float32)
     vec_symbol /= (np.linalg.norm(vec_symbol) + 1e-6)
+    
     best = 0.0
     best_detail = None
+    
     for tmpl in templates_list:
-        tmpl_norm = cv2.resize(tmpl, (W0,W0))
-        res = cv2.matchTemplate(symbol_norm, tmpl_norm, cv2.TM_CCOEFF_NORMED)
-        _, corr_score, _, _ = cv2.minMaxLoc(res)
-        tmpl_edges = cv2.Canny(tmpl_norm, 50,150)
-        res_e = cv2.matchTemplate(symbol_edges, tmpl_edges, cv2.TM_CCOEFF_NORMED)
-        _, edge_score, _, _ = cv2.minMaxLoc(res_e)
-        tmpl_inv = cv2.bitwise_not(tmpl_norm)
-        dist_tmpl = cv2.distanceTransform(tmpl_inv, cv2.DIST_L2, 3)
-        sym_pts = np.where(symbol_edges > 0)
-        tmpl_pts = np.where(tmpl_edges > 0)
-        ch1 = dist_tmpl[sym_pts].mean() if len(sym_pts[0])>0 else 50.0
-        ch2 = dist_symbol[tmpl_pts].mean() if len(tmpl_pts[0])>0 else 50.0
-        chamfer_score = np.exp(-0.5*(ch1+ch2)/10.0)
-        vec_tmpl = tmpl_norm.flatten().astype(np.float32)
-        vec_tmpl /= (np.linalg.norm(vec_tmpl)+1e-6)
-        cosine = float(np.dot(vec_symbol, vec_tmpl))
-        if cosine < 0: cosine = 0.0
-        combined = (0.35*corr_score + 0.20*edge_score + 0.25*chamfer_score + 0.20*cosine)
-        if combined > best:
-            best = combined
-            best_detail = {
+        # Probar con diferentes escalas para mayor robustez
+        scales = [0.9, 1.0, 1.1]
+        scale_scores = []
+        
+        for scale in scales:
+            # Escalar template
+            h_tmpl, w_tmpl = tmpl.shape
+            new_h, new_w = int(h_tmpl * scale), int(w_tmpl * scale)
+            if new_h <= 0 or new_w <= 0 or new_h > W0*2 or new_w > W0*2:
+                continue
+                
+            tmpl_scaled = cv2.resize(tmpl, (new_w, new_h))
+            tmpl_norm = cv2.resize(tmpl_scaled, (W0, W0))
+            
+            # Mejorar contraste del template también
+            tmpl_norm = cv2.equalizeHist(tmpl_norm)
+            
+            # 1. Correlación normalizada
+            res = cv2.matchTemplate(symbol_norm, tmpl_norm, cv2.TM_CCOEFF_NORMED)
+            _, corr_score, _, _ = cv2.minMaxLoc(res)
+            
+            # 2. Detección de bordes
+            tmpl_edges = cv2.Canny(tmpl_norm, 30, 150)
+            res_e = cv2.matchTemplate(symbol_edges, tmpl_edges, cv2.TM_CCOEFF_NORMED)
+            _, edge_score, _, _ = cv2.minMaxLoc(res_e)
+            
+            # 3. Chamfer distance
+            tmpl_inv = cv2.bitwise_not(tmpl_norm)
+            dist_tmpl = cv2.distanceTransform(tmpl_inv, cv2.DIST_L2, 3)
+            
+            sym_pts = np.where(symbol_edges > 0)
+            tmpl_pts = np.where(tmpl_edges > 0)
+            
+            ch1 = dist_tmpl[sym_pts].mean() if len(sym_pts[0]) > 0 else 50.0
+            ch2 = dist_symbol[tmpl_pts].mean() if len(tmpl_pts[0]) > 0 else 50.0
+            chamfer_score = np.exp(-0.5 * (ch1 + ch2) / 10.0)
+            
+            # 4. Similitud coseno
+            vec_tmpl = tmpl_norm.flatten().astype(np.float32)
+            vec_tmpl /= (np.linalg.norm(vec_tmpl) + 1e-6)
+            cosine = float(np.dot(vec_symbol, vec_tmpl))
+            if cosine < 0:
+                cosine = 0.0
+            
+            # 5. Similitud estructural (SSIM simplificado)
+            mean_s = np.mean(symbol_norm)
+            mean_t = np.mean(tmpl_norm)
+            std_s = np.std(symbol_norm)
+            std_t = np.std(tmpl_norm)
+            
+            cov = np.mean((symbol_norm - mean_s) * (tmpl_norm - mean_t))
+            ssim_score = (2 * mean_s * mean_t + 1e-6) / (mean_s**2 + mean_t**2 + 1e-6) * \
+                        (2 * cov + 1e-6) / (std_s**2 + std_t**2 + 1e-6)
+            ssim_score = max(0, min(1, ssim_score))  # Clamp entre 0 y 1
+            
+            # Score combinado con pesos ajustados para live detection
+            combined = (0.30 * corr_score + 
+                       0.20 * edge_score + 
+                       0.20 * chamfer_score + 
+                       0.15 * cosine +
+                       0.15 * ssim_score)
+            
+            scale_scores.append({
                 "corr": corr_score,
                 "edge": edge_score,
                 "chamfer": chamfer_score,
                 "cosine": cosine,
-                "combined": combined
-            }
+                "ssim": ssim_score,
+                "combined": combined,
+                "scale": scale
+            })
+        
+        # Tomar el mejor score entre todas las escalas
+        if scale_scores:
+            best_scale = max(scale_scores, key=lambda x: x["combined"])
+            
+            if best_scale["combined"] > best:
+                best = best_scale["combined"]
+                best_detail = best_scale
+    
     return best, (best_detail if best_detail else {})
 
 def enhanced_match_symbol_v2(symbol_img, templates_dict, symbol_type="rank"):
@@ -387,89 +474,154 @@ def enhanced_match_symbol_v2(symbol_img, templates_dict, symbol_type="rank"):
 # Rank
 # =========================================================
 def enhanced_rank_classification(rank_symbol, rank_templates):
-    name, score, _ = enhanced_match_symbol_v2(rank_symbol, rank_templates, "rank")
-    if name in ["Q","J","9"] or score < 0.6:
+    """
+    Clasificación mejorada de ranks con más robustez
+    """
+    # Preprocesar el símbolo
+    h, w = rank_symbol.shape
+    
+    # Mejorar contraste
+    rank_symbol = cv2.equalizeHist(rank_symbol)
+    
+    # Aplicar filtro bilateral para reducir ruido manteniendo bordes
+    rank_symbol = cv2.bilateralFilter(rank_symbol, 5, 50, 50)
+    
+    # Clasificación básica
+    name, score, detail = enhanced_match_symbol_v2(rank_symbol, rank_templates, "rank")
+    
+    # Para ranks problemáticos o scores bajos, probar con más variaciones
+    if name in ["Q", "J", "9", "8", "6"] or score < 0.5:
         best_name, best_score = name, score
-        for scale in [0.85,0.9,1.0,1.1]:
-            h,w = rank_symbol.shape
-            nh,nw = int(h*scale), int(w*scale)
-            if nh<=0 or nw<=0: continue
-            scaled = cv2.resize(rank_symbol, (nw,nh))
-            n_name, n_score, _ = enhanced_match_symbol_v2(scaled, rank_templates, "rank")
-            if n_score > best_score:
-                best_score = n_score
-                best_name = n_name
+        
+        # Probar diferentes escalas
+        for scale in [0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15]:
+            nh, nw = int(h * scale), int(w * scale)
+            if nh <= 0 or nw <= 0:
+                continue
+            
+            scaled = cv2.resize(rank_symbol, (nw, nh))
+            
+            # Probar con diferentes umbrales
+            for thresh_method in [None, 'otsu', 'adaptive']:
+                test_symbol = scaled.copy()
+                
+                if thresh_method == 'otsu':
+                    _, test_symbol = cv2.threshold(test_symbol, 0, 255, 
+                                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                elif thresh_method == 'adaptive':
+                    test_symbol = cv2.adaptiveThreshold(test_symbol, 255, 
+                                                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                        cv2.THRESH_BINARY, 11, 2)
+                
+                n_name, n_score, _ = enhanced_match_symbol_v2(test_symbol, rank_templates, "rank")
+                
+                if n_score > best_score:
+                    best_score = n_score
+                    best_name = n_name
+        
         return best_name, best_score
+    
     return name, score
 
 # =========================================================
 # Color stats (v3) con fallback rojo
 # =========================================================
 def extract_symbol_color_stats_v3(symbol_binary, corner_rgb, template_name=None):
+    """
+    Mejora en detección de color para condiciones de cámara en vivo
+    """
     contours, _ = find_contours(symbol_binary)
     if not contours:
         return {
-            "red_pct_hsv":0.0,"lab_a_mean":0.0,"rg_diff_mean":0.0,"cr_mean":0.0,
-            "lab_a_norm":0.0,"cr_norm":0.0,"red_confidence":0.0,"is_red":False,
-            "fallback_color_red":False
+            "red_pct_hsv": 0.0, "lab_a_mean": 0.0, "rg_diff_mean": 0.0, "cr_mean": 0.0,
+            "lab_a_norm": 0.0, "cr_norm": 0.0, "red_confidence": 0.0, "is_red": False,
+            "fallback_color_red": False
         }
+    
     largest = max(contours, key=cv2.contourArea)
-    x,y,w,h = cv2.boundingRect(largest)
+    x, y, w, h = cv2.boundingRect(largest)
     roi = corner_rgb[y:y+h, x:x+w]
-    mask = np.zeros((h,w), dtype=np.uint8)
-    shifted = largest - [x,y]
+    
+    mask = np.zeros((h, w), dtype=np.uint8)
+    shifted = largest - [x, y]
     cv2.drawContours(mask, [shifted], -1, 255, -1)
-
-    hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
-    lab = cv2.cvtColor(roi, cv2.COLOR_RGB2LAB)
-    ycrcb = cv2.cvtColor(roi, cv2.COLOR_RGB2YCrCb)
-
-    R = roi[:,:,0].astype(np.float32)
-    G = roi[:,:,1].astype(np.float32)
-    B = roi[:,:,2].astype(np.float32)
-    denom = (R+G+B+1e-6)
-    rg_diff = (R - G)/denom
-
-    symbol_mask = (mask>0)
-
+    
+    # Mejorar ROI con ecualización adaptativa
+    roi_lab = cv2.cvtColor(roi, cv2.COLOR_RGB2LAB)
+    l, a, b_channel = cv2.split(roi_lab)
+    
+    # Ecualización adaptativa del canal L
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    l_equalized = clahe.apply(l)
+    roi_lab_enhanced = cv2.merge([l_equalized, a, b_channel])
+    roi_enhanced = cv2.cvtColor(roi_lab_enhanced, cv2.COLOR_LAB2RGB)
+    
+    # Conversiones de espacio de color
+    hsv = cv2.cvtColor(roi_enhanced, cv2.COLOR_RGB2HSV)
+    lab = cv2.cvtColor(roi_enhanced, cv2.COLOR_RGB2LAB)
+    ycrcb = cv2.cvtColor(roi_enhanced, cv2.COLOR_RGB2YCrCb)
+    
+    R = roi_enhanced[:, :, 0].astype(np.float32)
+    G = roi_enhanced[:, :, 1].astype(np.float32)
+    B = roi_enhanced[:, :, 2].astype(np.float32)
+    denom = (R + G + B + 1e-6)
+    rg_diff = (R - G) / denom
+    
+    symbol_mask = (mask > 0)
+    
+    # Rangos de rojo más amplios y adaptativos
     lower_sets = [
-        ((0,25,25),(12,255,255)),
-        ((8,25,25),(25,255,255)),
-        ((165,25,25),(180,255,255))
+        ((0, 20, 20), (15, 255, 255)),      # Rojo bajo
+        ((5, 20, 20), (25, 255, 255)),      # Rojo medio-bajo
+        ((160, 20, 20), (180, 255, 255)),   # Rojo alto
+        ((170, 20, 20), (180, 255, 255))    # Rojo muy alto
     ]
+    
     red_hsv_mask = np.zeros_like(mask)
-    for (l,u) in lower_sets:
-        l_arr = np.array(l, dtype=np.uint8)
-        u_arr = np.array(u, dtype=np.uint8)
+    for (l_bound, u_bound) in lower_sets:
+        l_arr = np.array(l_bound, dtype=np.uint8)
+        u_arr = np.array(u_bound, dtype=np.uint8)
         temp = cv2.inRange(hsv, l_arr, u_arr)
         red_hsv_mask = cv2.bitwise_or(red_hsv_mask, temp)
-
-    red_pct_hsv = np.sum((red_hsv_mask>0) & symbol_mask) / (np.sum(symbol_mask)+1e-6)
-    a_lab = lab[:,:,1]
-    Cr = ycrcb[:,:,1]
-    lab_a_mean = np.mean(a_lab[symbol_mask]) if np.sum(symbol_mask)>0 else 0.0
-    rg_diff_mean = np.mean(rg_diff[symbol_mask]) if np.sum(symbol_mask)>0 else 0.0
-    cr_mean = np.mean(Cr[symbol_mask]) if np.sum(symbol_mask)>0 else 0.0
-    lab_a_norm = (lab_a_mean - 128)/64.0
-    cr_norm = (cr_mean - 128)/64.0
-
-    raw_score = (0.35*red_pct_hsv + 0.25*max(0,lab_a_norm) + 0.25*max(0,rg_diff_mean) + 0.15*max(0,cr_norm))
-    red_confidence = 1.0 / (1.0 + math.exp(-8*(raw_score - 0.18)))
-    is_red = red_confidence > 0.30
-
+    
+    red_pct_hsv = np.sum((red_hsv_mask > 0) & symbol_mask) / (np.sum(symbol_mask) + 1e-6)
+    
+    a_lab = lab[:, :, 1]
+    Cr = ycrcb[:, :, 1]
+    
+    lab_a_mean = np.mean(a_lab[symbol_mask]) if np.sum(symbol_mask) > 0 else 0.0
+    rg_diff_mean = np.mean(rg_diff[symbol_mask]) if np.sum(symbol_mask) > 0 else 0.0
+    cr_mean = np.mean(Cr[symbol_mask]) if np.sum(symbol_mask) > 0 else 0.0
+    
+    lab_a_norm = (lab_a_mean - 128) / 64.0
+    cr_norm = (cr_mean - 128) / 64.0
+    
+    # Score de rojo ajustado para mejor detección
+    raw_score = (0.40 * red_pct_hsv + 
+                 0.25 * max(0, lab_a_norm) + 
+                 0.20 * max(0, rg_diff_mean) + 
+                 0.15 * max(0, cr_norm))
+    
+    red_confidence = 1.0 / (1.0 + math.exp(-10 * (raw_score - 0.15)))  # Sigmoid más agresivo
+    is_red = red_confidence > 0.25  # Umbral más bajo
+    
+    # Fallback mejorado
     fallback_color_red = False
-    if (template_name in ["Corazones","Diamantes"]) and not is_red:
-        kernel = np.ones((3,3), np.uint8)
-        dil_mask = cv2.dilate(mask, kernel, iterations=1)
-        dil_symbol = (dil_mask>0)
-        R_mean = np.mean(R[dil_symbol]) if np.sum(dil_symbol)>0 else 0
-        G_mean = np.mean(G[dil_symbol]) if np.sum(dil_symbol)>0 else 0
-        B_mean = np.mean(B[dil_symbol]) if np.sum(dil_symbol)>0 else 0
-        if (R_mean - G_mean > 10) and (R_mean - B_mean > 10):
-            red_confidence = max(red_confidence, 0.42)
+    if (template_name in ["Corazones", "Diamantes"]) and not is_red:
+        kernel = np.ones((3, 3), np.uint8)
+        dil_mask = cv2.dilate(mask, kernel, iterations=2)  # Más dilatación
+        dil_symbol = (dil_mask > 0)
+        
+        R_mean = np.mean(R[dil_symbol]) if np.sum(dil_symbol) > 0 else 0
+        G_mean = np.mean(G[dil_symbol]) if np.sum(dil_symbol) > 0 else 0
+        B_mean = np.mean(B[dil_symbol]) if np.sum(dil_symbol) > 0 else 0
+        
+        # Criterio más permisivo
+        if (R_mean - G_mean > 5) and (R_mean - B_mean > 5):
+            red_confidence = max(red_confidence, 0.40)
             is_red = True
             fallback_color_red = True
-
+    
     return {
         "red_pct_hsv": red_pct_hsv,
         "lab_a_mean": lab_a_mean,
@@ -529,67 +681,124 @@ def compute_shape_metrics(symbol_binary):
 # Heart features
 # =========================================================
 def compute_heart_features(symbol_binary):
-    h,w = symbol_binary.shape
-    if h<8 or w<8:
+    """
+    Características de corazón mejoradas para cámara en vivo
+    """
+    h, w = symbol_binary.shape
+    if h < 8 or w < 8:
         return {
-            "peak_count":0,
-            "top_bottom_ratio":1.0,
-            "symmetry":0.0,
-            "avg_roundness":0.0,
-            "heart_lobes_score":0.0
+            "peak_count": 0,
+            "top_bottom_ratio": 1.0,
+            "symmetry": 0.0,
+            "avg_roundness": 0.0,
+            "heart_lobes_score": 0.0
         }
-    H0,W0 = 64,64
-    norm = cv2.resize(symbol_binary, (W0,W0), interpolation=cv2.INTER_NEAREST)
-    top_h = H0//3
-    top_region = norm[:top_h,:]
+    
+    # Preprocesamiento mejorado
+    H0, W0 = 64, 64
+    norm = cv2.resize(symbol_binary, (W0, W0), interpolation=cv2.INTER_AREA)  # INTER_AREA mejor para reducción
+    
+    # Aplicar morfología para mejorar forma
+    kernel = np.ones((2, 2), np.uint8)
+    norm = cv2.morphologyEx(norm, cv2.MORPH_CLOSE, kernel)
+    
+    top_h = H0 // 3
+    top_region = norm[:top_h, :]
     col_sum = top_region.sum(axis=0).astype(np.float32)
+    
+    # Suavizado mejorado
     if SCIPY_AVAILABLE:
-        col_smooth = ndi.gaussian_filter1d(col_sum, sigma=2)
+        col_smooth = ndi.gaussian_filter1d(col_sum, sigma=2.5)  # Sigma más alto
     else:
-        kernel = np.ones(5)/5.0
-        col_smooth = np.convolve(col_sum, kernel, mode='same')
+        kernel_smooth = np.ones(7) / 7.0  # Kernel más grande
+        col_smooth = np.convolve(col_sum, kernel_smooth, mode='same')
+    
+    # Detección de picos mejorada
     peaks = []
-    for i in range(1,len(col_smooth)-1):
-        if col_smooth[i]>col_smooth[i-1] and col_smooth[i]>col_smooth[i+1]:
+    for i in range(2, len(col_smooth) - 2):  # Más margen
+        # Verificar que sea un pico local
+        if (col_smooth[i] > col_smooth[i-1] and col_smooth[i] > col_smooth[i+1] and
+            col_smooth[i] > col_smooth[i-2] and col_smooth[i] > col_smooth[i+2]):
             peaks.append(i)
-    threshold_peak = 0.25*col_smooth.max() if col_smooth.max()>0 else 0
-    peaks = [p for p in peaks if col_smooth[p]>=threshold_peak]
-    active_cols = np.where(col_smooth > 0.20*(col_smooth.max()+1e-6))[0]
-    top_width = active_cols[-1]-active_cols[0]+1 if len(active_cols)>0 else W0
-    bottom_region = norm[-top_h:,:]
+    
+    threshold_peak = 0.20 * col_smooth.max() if col_smooth.max() > 0 else 0  # Umbral más bajo
+    peaks = [p for p in peaks if col_smooth[p] >= threshold_peak]
+    
+    # Filtrar picos muy cercanos
+    filtered_peaks = []
+    min_distance = W0 // 5  # Distancia mínima entre picos
+    for peak in peaks:
+        if not filtered_peaks or abs(peak - filtered_peaks[-1]) > min_distance:
+            filtered_peaks.append(peak)
+    
+    peaks_count = len(filtered_peaks)
+    
+    active_cols = np.where(col_smooth > 0.15 * (col_smooth.max() + 1e-6))[0]
+    top_width = active_cols[-1] - active_cols[0] + 1 if len(active_cols) > 0 else W0
+    
+    bottom_region = norm[-top_h:, :]
     bottom_sum = bottom_region.sum(axis=0)
-    bottom_active = np.where(bottom_sum > 0.20*(bottom_sum.max()+1e-6))[0]
-    bottom_width = bottom_active[-1]-bottom_active[0]+1 if len(bottom_active)>0 else W0
-    top_bottom_ratio = top_width / bottom_width if bottom_width>0 else 1.0
-    left_half = top_region[:, :W0//2]
-    right_half = top_region[:, W0//2:]
+    bottom_active = np.where(bottom_sum > 0.15 * (bottom_sum.max() + 1e-6))[0]
+    bottom_width = bottom_active[-1] - bottom_active[0] + 1 if len(bottom_active) > 0 else W0
+    top_bottom_ratio = top_width / bottom_width if bottom_width > 0 else 1.0
+    
+    # Simetría mejorada
+    left_half = top_region[:, :W0 // 2]
+    right_half = top_region[:, W0 // 2:]
     right_reflect = np.flip(right_half, axis=1)
-    l_vec = left_half.flatten().astype(np.float32)
-    r_vec = right_reflect.flatten().astype(np.float32)
-    l_vec /= (np.linalg.norm(l_vec)+1e-6)
-    r_vec /= (np.linalg.norm(r_vec)+1e-6)
+    
+    # Normalizar antes de comparar
+    left_norm = left_half.astype(np.float32)
+    right_norm = right_reflect.astype(np.float32)
+    
+    if left_norm.max() > 0:
+        left_norm = left_norm / left_norm.max()
+    if right_norm.max() > 0:
+        right_norm = right_norm / right_norm.max()
+    
+    l_vec = left_norm.flatten()
+    r_vec = right_norm.flatten()
+    l_vec /= (np.linalg.norm(l_vec) + 1e-6)
+    r_vec /= (np.linalg.norm(r_vec) + 1e-6)
     symmetry = float(np.dot(l_vec, r_vec))
-    gauss_x = np.linspace(-1,1,W0//2)
-    gauss_y = np.linspace(-1,1,top_h)
-    gx,gy = np.meshgrid(gauss_x, gauss_y)
-    gauss_mask = np.exp(-(gx*2 + gy*2)*3.0)
-    gauss_mask = (gauss_mask - gauss_mask.min())/(gauss_mask.max()-gauss_mask.min()+1e-6)
+    
+    # Redondez de lóbulos
+    gauss_x = np.linspace(-1, 1, W0 // 2)
+    gauss_y = np.linspace(-1, 1, top_h)
+    gx, gy = np.meshgrid(gauss_x, gauss_y)
+    gauss_mask = np.exp(-(gx * gx + gy * gy) * 2.0)
+    gauss_mask = (gauss_mask - gauss_mask.min()) / (gauss_mask.max() - gauss_mask.min() + 1e-6)
+    
     def roundness_score(lobe):
-        if lobe.sum()==0:
+        if lobe.sum() == 0:
             return 0.0
-        ln = (lobe - lobe.min())/(lobe.max()-lobe.min()+1e-6)
-        return float(np.sum(ln * gauss_mask)/np.sum(gauss_mask))
-    left_roundness = roundness_score(left_half.astype(np.float32))
-    right_roundness = roundness_score(right_half.astype(np.float32))
-    avg_roundness = (left_roundness + right_roundness)/2.0
-    peaks_count = len(peaks)
+        ln = lobe.astype(np.float32)
+        if ln.max() > 0:
+            ln = (ln - ln.min()) / (ln.max() - ln.min() + 1e-6)
+        return float(np.sum(ln * gauss_mask) / (np.sum(gauss_mask) + 1e-6))
+    
+    left_roundness = roundness_score(left_half)
+    right_roundness = roundness_score(right_half)
+    avg_roundness = (left_roundness + right_roundness) / 2.0
+    
+    # Score ajustado para mejor detección
     lobes_score = 0.0
-    if peaks_count >= 2: lobes_score += 0.4
-    elif peaks_count == 1: lobes_score += 0.15
-    if top_bottom_ratio > 1.05: lobes_score += 0.25
-    if avg_roundness > 0.45: lobes_score += 0.2
-    if symmetry > 0.85: lobes_score += 0.15
+    if peaks_count >= 2:
+        lobes_score += 0.45  # Más peso a dos picos
+    elif peaks_count == 1:
+        lobes_score += 0.10
+    
+    if top_bottom_ratio > 1.02:  # Umbral más bajo
+        lobes_score += 0.25
+    
+    if avg_roundness > 0.40:  # Umbral más bajo
+        lobes_score += 0.20
+    
+    if symmetry > 0.80:  # Umbral más bajo
+        lobes_score += 0.10
+    
     lobes_score = min(lobes_score, 1.0)
+    
     return {
         "peak_count": peaks_count,
         "top_bottom_ratio": top_bottom_ratio,

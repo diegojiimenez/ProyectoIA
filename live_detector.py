@@ -56,10 +56,13 @@ class LiveCardDetector:
         self.last_detection = None
         self.detection_history = deque(maxlen=5)  # Últimas 5 detecciones
         self.last_detection_time = 0
-        self.detection_cooldown = 1.5  # segundos entre anuncios
         
-        # Configuración de umbral mínimo de área para detectar cartas
-        self.min_card_area = 30000  # Ajustar según distancia de la cámara
+        # Configuración mejorada para detección en vivo
+        self.detection_cooldown = 1.0  # Reducir cooldown
+        self.min_card_area = 25000  # Área mínima más pequeña para permitir cartas más lejanas
+        
+        # Buffer de frames para mejor estabilización
+        self.frame_buffer = deque(maxlen=10)
         
         # Estado de pausa
         self.paused = False
@@ -93,21 +96,39 @@ class LiveCardDetector:
     
     def process_frame(self, frame):
         """
-        Procesa un frame y detecta cartas
-        
-        Returns:
-            frame: Frame con anotaciones dibujadas
-            rank: Rank detectado (o None)
-            suit: Suit detectado (o None)
-            scores: Tupla (rank_score, suit_score) o None
+        Procesa un frame con preprocesamiento mejorado
         """
         try:
-            # Convertir BGR a RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Preprocesar frame para mejorar calidad
+            # 1. Reducir ruido
+            frame_denoised = cv2.fastNlMeansDenoisingColored(frame, None, 10, 10, 7, 21)
             
-            # Detectar carta en el frame
+            # Convertir BGR a RGB
+            frame_rgb = cv2.cvtColor(frame_denoised, cv2.COLOR_BGR2RGB)
+            
+            # Mejorar contraste adaptativo
+            lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l_enhanced = clahe.apply(l)
+            
+            lab_enhanced = cv2.merge([l_enhanced, a, b])
+            frame_rgb = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+            
+            # Detectar carta
             gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Aplicar filtro bilateral para suavizar manteniendo bordes
+            gray_filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+            
+            # Umbralización mejorada
+            _, binary = cv2.threshold(gray_filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Aplicar morfología para mejorar detección de contorno
+            kernel = np.ones((5, 5), np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
             
             card_contour, area = find_card_contour_from_binary(binary, min_area=self.min_card_area)
             
@@ -120,7 +141,6 @@ class LiveCardDetector:
             thresh_corner, symbols = extract_symbols_from_corner(corner)
             
             if len(symbols) < 2:
-                # Dibujar contorno pero sin detección
                 cv2.drawContours(frame, [card_contour], -1, (0, 255, 255), 3)
                 return frame, None, None, None
             
@@ -133,15 +153,15 @@ class LiveCardDetector:
                 potential_suit, corner, self.suit_templates, self.suit_color_prototypes
             )
             
-            # Verificar scores mínimos
-            if rank_score < 0.30 or suit_score < 0.30:
+            # Umbrales más bajos para cámara en vivo
+            if rank_score < 0.25 or suit_score < 0.25:
                 cv2.drawContours(frame, [card_contour], -1, (0, 255, 255), 3)
                 return frame, None, None, None
             
             # Estabilizar detección
             stable_rank, stable_suit = self.stabilize_detection(rank_match, suit_match)
             
-            # Dibujar contorno verde si hay detección estable
+            # Dibujar contorno
             if stable_rank and stable_suit:
                 cv2.drawContours(frame, [card_contour], -1, (0, 255, 0), 3)
             else:
@@ -151,6 +171,8 @@ class LiveCardDetector:
             
         except Exception as e:
             print(f"Error procesando frame: {e}")
+            import traceback
+            traceback.print_exc()
             return frame, None, None, None
     
     def draw_info_panel(self, frame, rank, suit, scores, fps):
