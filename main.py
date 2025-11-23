@@ -1124,16 +1124,58 @@ def interactive_process_and_classify(image_path, rank_templates, suit_templates,
     }
 
 # =========================================================
+# Modo de detección en vivo
+# =========================================================
+def run_live_mode(camera_url=None):
+    """
+    Ejecuta el modo de detección en vivo
+    """
+    from live_detector import LiveCardDetector
+    
+    print("Construyendo templates...")
+    rank_templates, suit_templates, suit_color_prototypes = build_templates_from_directory("template/")
+    print(f"Ranks disponibles: {list(rank_templates.keys())}")
+    print(f"Suits disponibles: {list(suit_templates.keys())}")
+    
+    try:
+        detector = LiveCardDetector(
+            rank_templates, 
+            suit_templates, 
+            suit_color_prototypes, 
+            camera_source=camera_url
+        )
+        detector.run()
+    except Exception as e:
+        print(f"\n❌ Error al iniciar detector: {e}")
+        print("\nPosibles soluciones:")
+        print("1. Verifica que DroidCam esté corriendo en tu teléfono")
+        print("2. Verifica que estés en la misma red WiFi")
+        print("3. Verifica la URL (debe terminar en /video)")
+        print("4. Ejemplo: http://192.168.1.100:4747/video")
+
+# =========================================================
 # Main
 # =========================================================
 def main():
-    parser = argparse.ArgumentParser(description="Reconocimiento de cartas (v7 - diamantes mejorados).")
+    parser = argparse.ArgumentParser(description="Reconocimiento de cartas (v7 - con detección en vivo).")
     parser.add_argument("--content-dir", default="content/", help="Directorio con imágenes de cartas.")
     parser.add_argument("--template-dir", default="template/", help="Directorio con templates.")
     parser.add_argument("--no-interactive", action="store_true", help="Modo automático (sin Enter).")
-    parser.add_argument("--save-csv", action="store_true", help="Guardar resultados en card_recognition_results.csv")
+    parser.add_argument("--save-csv", action="store_true", help="Guardar resultados en CSV")
+    
+    # Argumentos para modo live
+    parser.add_argument("--live", action="store_true", help="Modo detección en vivo con DroidCam")
+    parser.add_argument("--camera-url", type=str, default=None, 
+                       help="URL de DroidCam (ej: http://192.168.1.100:4747/video)")
+    
     args = parser.parse_args()
 
+    # Modo detección en vivo
+    if args.live:
+        run_live_mode(args.camera_url)
+        return
+
+    # Resto del código existente...
     content_dir = args.content_dir
     template_dir = args.template_dir
     interactive = not args.no_interactive
