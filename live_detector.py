@@ -96,39 +96,17 @@ class LiveCardDetector:
     
     def process_frame(self, frame):
         """
-        Procesa un frame con preprocesamiento mejorado
+        Procesa un frame - VERSIÓN OPTIMIZADA sin delay
         """
         try:
-            # Preprocesar frame para mejorar calidad
-            # 1. Reducir ruido
-            frame_denoised = cv2.fastNlMeansDenoisingColored(frame, None, 10, 10, 7, 21)
+            # Convertir BGR a RGB directamente (sin denoising que causa delay)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Convertir BGR a RGB
-            frame_rgb = cv2.cvtColor(frame_denoised, cv2.COLOR_BGR2RGB)
-            
-            # Mejorar contraste adaptativo
-            lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            l_enhanced = clahe.apply(l)
-            
-            lab_enhanced = cv2.merge([l_enhanced, a, b])
-            frame_rgb = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-            
-            # Detectar carta
+            # Detectar carta con procesamiento mínimo
             gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
             
-            # Aplicar filtro bilateral para suavizar manteniendo bordes
-            gray_filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-            
-            # Umbralización mejorada
-            _, binary = cv2.threshold(gray_filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Aplicar morfología para mejorar detección de contorno
-            kernel = np.ones((5, 5), np.uint8)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            # Umbralización simple y rápida
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
             card_contour, area = find_card_contour_from_binary(binary, min_area=self.min_card_area)
             
@@ -153,7 +131,7 @@ class LiveCardDetector:
                 potential_suit, corner, self.suit_templates, self.suit_color_prototypes
             )
             
-            # Umbrales más bajos para cámara en vivo
+            # Umbrales para cámara en vivo
             if rank_score < 0.25 or suit_score < 0.25:
                 cv2.drawContours(frame, [card_contour], -1, (0, 255, 255), 3)
                 return frame, None, None, None
@@ -171,8 +149,6 @@ class LiveCardDetector:
             
         except Exception as e:
             print(f"Error procesando frame: {e}")
-            import traceback
-            traceback.print_exc()
             return frame, None, None, None
     
     def draw_info_panel(self, frame, rank, suit, scores, fps):

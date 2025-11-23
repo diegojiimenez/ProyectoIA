@@ -475,49 +475,192 @@ def enhanced_match_symbol_v2(symbol_img, templates_dict, symbol_type="rank"):
 # =========================================================
 def enhanced_rank_classification(rank_symbol, rank_templates):
     """
-    Clasificación mejorada de ranks con más robustez
+    Clasificación mejorada de ranks con detección específica para números problemáticos
     """
     # Preprocesar el símbolo
     h, w = rank_symbol.shape
     
     # Mejorar contraste
-    rank_symbol = cv2.equalizeHist(rank_symbol)
+    rank_symbol_enhanced = cv2.equalizeHist(rank_symbol)
     
     # Aplicar filtro bilateral para reducir ruido manteniendo bordes
-    rank_symbol = cv2.bilateralFilter(rank_symbol, 5, 50, 50)
+    rank_symbol_denoised = cv2.bilateralFilter(rank_symbol_enhanced, 5, 50, 50)
     
-    # Clasificación básica
-    name, score, detail = enhanced_match_symbol_v2(rank_symbol, rank_templates, "rank")
+    # Clasificación básica con símbolo mejorado
+    name, score, detail = enhanced_match_symbol_v2(rank_symbol_denoised, rank_templates, "rank")
     
-    # Para ranks problemáticos o scores bajos, probar con más variaciones
-    if name in ["Q", "J", "9", "8", "6"] or score < 0.5:
+    # NUEVA LÓGICA: Validación específica para números problemáticos
+    problematic_pairs = {
+        '8': ['5', '6', '3'],  # 8 se confunde con estos
+        '5': ['8', '6'],       # 5 se confunde con estos
+        '10': ['6', '8'],      # 10 se confunde con estos
+        '3': ['8', '6', '5'],  # 3 se confunde con estos
+        '6': ['8', '5', '3']   # 6 se confunde con estos
+    }
+    
+    # Si detectamos uno de los números problemáticos con score bajo, hacer validación extra
+    if name in problematic_pairs and score < 0.65:
+        print(f"  [Validación extra para '{name}' con score {score:.3f}]")
+        
+        # Crear versiones alternativas del símbolo para mejorar matching
+        alternative_versions = []
+        
+        # 1. Original mejorado
+        alternative_versions.append(('original_enhanced', rank_symbol_denoised))
+        
+        # 2. Con umbral Otsu
+        _, otsu = cv2.threshold(rank_symbol_enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        alternative_versions.append(('otsu', otsu))
+        
+        # 3. Con umbral adaptativo Gaussian
+        adaptive_gauss = cv2.adaptiveThreshold(
+            rank_symbol_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 3
+        )
+        alternative_versions.append(('adaptive_gauss', adaptive_gauss))
+        
+        # 4. Con erosión para hacer más gruesos los trazos (útil para distinguir 8 vs 5)
+        kernel_thick = np.ones((2, 2), np.uint8)
+        thickened = cv2.erode(rank_symbol_denoised, kernel_thick, iterations=1)
+        alternative_versions.append(('thickened', thickened))
+        
+        # 5. Con dilatación para hacer más delgados (útil para 10 vs 6)
+        thinned = cv2.dilate(rank_symbol_denoised, kernel_thick, iterations=1)
+        alternative_versions.append(('thinned', thinned))
+        
+        # Probar todas las versiones con diferentes escalas
+        best_candidates = {}
+        
+        for version_name, version_img in alternative_versions:
+            for scale in [0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15]:
+                nh, nw = int(h * scale), int(w * scale)
+                if nh <= 0 or nw <= 0:
+                    continue
+                
+                scaled = cv2.resize(version_img, (nw, nh))
+                test_name, test_score, _ = enhanced_match_symbol_v2(scaled, rank_templates, "rank")
+                
+                # Guardar mejores scores por cada número
+                if test_name not in best_candidates or test_score > best_candidates[test_name]['score']:
+                    best_candidates[test_name] = {
+                        'score': test_score,
+                        'version': version_name,
+                        'scale': scale
+                    }
+        
+        # Analizar los mejores candidatos
+        if best_candidates:
+            # Ordenar por score
+            sorted_candidates = sorted(best_candidates.items(), key=lambda x: x[1]['score'], reverse=True)
+            
+            print(f"  Top candidatos:")
+            for rank_name, info in sorted_candidates[:3]:
+                print(f"    {rank_name}: {info['score']:.3f} ({info['version']}, scale={info['scale']:.2f})")
+            
+            # REGLAS ESPECÍFICAS para desambiguar
+            top_rank, top_info = sorted_candidates[0]
+            second_rank, second_info = sorted_candidates[1] if len(sorted_candidates) > 1 else (None, {'score': 0})
+            
+            # Diferencia entre los dos mejores
+            score_diff = top_info['score'] - second_info['score']
+            
+            # Validación para 8 vs 5
+            if name == '8' and '5' in [r for r, _ in sorted_candidates[:2]]:
+                # El 8 tiene dos círculos cerrados, el 5 solo uno
+                # Buscar características específicas
+                _, binary = cv2.threshold(rank_symbol_enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                # Contar regiones cerradas (componentes conectados en la versión invertida)
+                inverted = cv2.bitwise_not(binary)
+                num_labels, labels = cv2.connectedComponents(inverted)
+                
+                # El 8 debería tener más componentes cerrados que el 5
+                if num_labels >= 3 and top_rank == '8':  # 1 fondo + 2 círculos internos del 8
+                    print(f"  → Confirmado '8' por componentes cerrados ({num_labels})")
+                    name, score = '8', max(top_info['score'], 0.70)
+                elif num_labels <= 2 and top_rank == '5':
+                    print(f"  → Confirmado '5' por componentes cerrados ({num_labels})")
+                    name, score = '5', max(top_info['score'], 0.70)
+                elif score_diff > 0.15:
+                    name, score = top_rank, top_info['score']
+            
+            # Validación para 10 vs 6
+            elif name == '10' and '6' in [r for r, _ in sorted_candidates[:2]]:
+                # El 10 tiene dos dígitos separados, el 6 es un solo dígito
+                # Detectar si hay espacio horizontal significativo (gap entre 1 y 0)
+                _, binary = cv2.threshold(rank_symbol_enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                
+                # Proyección horizontal
+                horizontal_projection = np.sum(binary, axis=0)
+                
+                # Buscar valles (espacios vacíos) en la proyección
+                threshold_valley = 0.2 * horizontal_projection.max()
+                valleys = horizontal_projection < threshold_valley
+                
+                # Contar transiciones (cambios de píxel blanco a negro)
+                transitions = 0
+                for i in range(1, len(valleys)):
+                    if valleys[i] != valleys[i-1]:
+                        transitions += 1
+                
+                # El 10 debería tener más transiciones por el gap entre dígitos
+                if transitions >= 4 and top_rank == '10':
+                    print(f"  → Confirmado '10' por separación de dígitos ({transitions} transiciones)")
+                    name, score = '10', max(top_info['score'], 0.70)
+                elif transitions <= 3 and top_rank == '6':
+                    print(f"  → Confirmado '6' por dígito único ({transitions} transiciones)")
+                    name, score = '6', max(top_info['score'], 0.70)
+                elif score_diff > 0.15:
+                    name, score = top_rank, top_info['score']
+            
+            # Validación para 3 vs 6 vs 8
+            elif name == '3' and any(r in ['6', '8'] for r, _ in sorted_candidates[:2]):
+                # El 3 tiene curvas abiertas hacia la derecha, 6 y 8 más cerradas
+                # Analizar la distribución de píxeles en cuadrantes
+                _, binary = cv2.threshold(rank_symbol_enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                h_mid = h // 2
+                w_mid = w // 2
+                
+                # Dividir en cuadrantes
+                top_left = np.sum(binary[:h_mid, :w_mid])
+                top_right = np.sum(binary[:h_mid, w_mid:])
+                bottom_left = np.sum(binary[h_mid:, :w_mid])
+                bottom_right = np.sum(binary[h_mid:, w_mid:])
+                
+                # El 3 tiene más píxeles en el lado derecho
+                right_ratio = (top_right + bottom_right) / (top_left + bottom_left + 1e-6)
+                
+                if right_ratio > 1.2 and top_rank == '3':
+                    print(f"  → Confirmado '3' por distribución derecha ({right_ratio:.2f})")
+                    name, score = '3', max(top_info['score'], 0.70)
+                elif right_ratio <= 1.2 and top_rank in ['6', '8']:
+                    print(f"  → Confirmado '{top_rank}' por distribución ({right_ratio:.2f})")
+                    name, score = top_rank, max(top_info['score'], 0.70)
+                elif score_diff > 0.15:
+                    name, score = top_rank, top_info['score']
+            
+            # Para otros casos, si hay diferencia significativa, usar el mejor
+            elif score_diff > 0.20:
+                name, score = top_rank, top_info['score']
+            elif top_info['score'] > 0.70:
+                name, score = top_rank, top_info['score']
+    
+    # Para ranks no problemáticos o con score alto, mantener el resultado original
+    elif score < 0.50:
+        # Hacer una búsqueda adicional con variaciones
         best_name, best_score = name, score
         
-        # Probar diferentes escalas
-        for scale in [0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15]:
+        for scale in [0.85, 0.90, 0.95, 1.0, 1.05, 1.10]:
             nh, nw = int(h * scale), int(w * scale)
             if nh <= 0 or nw <= 0:
                 continue
             
-            scaled = cv2.resize(rank_symbol, (nw, nh))
+            scaled = cv2.resize(rank_symbol_denoised, (nw, nh))
+            n_name, n_score, _ = enhanced_match_symbol_v2(scaled, rank_templates, "rank")
             
-            # Probar con diferentes umbrales
-            for thresh_method in [None, 'otsu', 'adaptive']:
-                test_symbol = scaled.copy()
-                
-                if thresh_method == 'otsu':
-                    _, test_symbol = cv2.threshold(test_symbol, 0, 255, 
-                                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                elif thresh_method == 'adaptive':
-                    test_symbol = cv2.adaptiveThreshold(test_symbol, 255, 
-                                                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                        cv2.THRESH_BINARY, 11, 2)
-                
-                n_name, n_score, _ = enhanced_match_symbol_v2(test_symbol, rank_templates, "rank")
-                
-                if n_score > best_score:
-                    best_score = n_score
-                    best_name = n_name
+            if n_score > best_score:
+                best_score = n_score
+                best_name = n_name
         
         return best_name, best_score
     
