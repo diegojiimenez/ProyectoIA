@@ -4,295 +4,274 @@ import time
 import os
 from collections import deque, Counter
 
-# Importar funciones del main
 from main import (
     find_card_contour_from_binary,
     four_point_transform,
     extract_top_left_corner,
     extract_symbols_from_corner,
     enhanced_rank_classification,
-    classify_suit_v7
+    classify_suit_v7,
+    find_all_card_contours_from_binary  # NUEVO
 )
 
 class LiveCardDetector:
-    """
-    Detector de cartas en tiempo real usando cámara IP (DroidCam)
-    """
     def __init__(self, rank_templates, suit_templates, suit_color_prototypes, camera_source=None):
-        """
-        Args:
-            rank_templates: Diccionario con templates de números
-            suit_templates: Diccionario con templates de palos
-            suit_color_prototypes: Prototipos de color para palos
-            camera_source: URL de DroidCam o ID de cámara local
-                          Ejemplo: "http://192.168.1.100:4747/video"
-                          o 0 para cámara local
-        """
         self.rank_templates = rank_templates
         self.suit_templates = suit_templates
         self.suit_color_prototypes = suit_color_prototypes
-        
-        # Configurar fuente de video
+
         if camera_source is None:
-            camera_source = 0  # Cámara por defecto
-        
+            camera_source = 0
         print(f"Intentando conectar a cámara: {camera_source}")
         self.cap = cv2.VideoCapture(camera_source)
-        
         if not self.cap.isOpened():
-            raise Exception(f"No se pudo abrir la cámara: {camera_source}\n"
-                          "Verifica que DroidCam esté corriendo y la URL sea correcta.")
-        
-        # Configurar resolución (DroidCam soporta hasta 1920x1080)
+            raise Exception(f"No se pudo abrir la cámara: {camera_source}\nVerifica DroidCam / URL.")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        
-        # Obtener resolución real
-        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Resolución de cámara: {actual_width}x{actual_height}")
-        
-        # Variables de estado para estabilización
-        self.last_detection = None
-        self.detection_history = deque(maxlen=5)  # Últimas 5 detecciones
-        self.last_detection_time = 0
-        
-        # Configuración mejorada para detección en vivo
-        self.detection_cooldown = 1.0  # Reducir cooldown
-        self.min_card_area = 25000  # Área mínima más pequeña para permitir cartas más lejanas
-        
-        # Buffer de frames para mejor estabilización
-        self.frame_buffer = deque(maxlen=10)
-        
-        # Estado de pausa
+
+        self.min_card_area = 25000
         self.paused = False
         self.last_frame = None
-        
-    def stabilize_detection(self, rank, suit):
+
+        # Historial por “celda” (posición) para estabilizar cada carta
+        # key -> deque([(rank,suit)])
+        self.per_card_histories = {}
+        self.history_len = 6
+        self.stable_threshold = 3  # mínimo apariciones para considerar estable
+
+        # Guardar último warp por key para captura individual si quieres
+        self.last_warps = {}
+
+        self.detection_cooldown = 0.8
+        self.last_announce_time = 0
+        self.last_announced_cards = set()  # {(rank,suit,key)}
+
+    def _cell_key(self, contour):
         """
-        Estabiliza la detección usando historial para evitar falsos positivos
-        Solo reporta una detección si aparece al menos 3 veces en las últimas 5 frames
+        Genera una clave de celda para agrupar detecciones de la misma carta
+        basado en el centro aproximado del contorno.
         """
-        self.detection_history.append((rank, suit))
-        
-        if len(self.detection_history) < 3:
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            return None
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        # Cuantizar para evitar variaciones pequeñas
+        return (cx // 40, cy // 40)
+
+    def _update_history(self, key, rank, suit):
+        if key is None:
+            return
+        dq = self.per_card_histories.get(key)
+        if dq is None:
+            dq = deque(maxlen=self.history_len)
+            self.per_card_histories[key] = dq
+        dq.append((rank, suit))
+
+    def _stable_vote(self, key):
+        dq = self.per_card_histories.get(key)
+        if dq is None or len(dq) < self.stable_threshold:
             return None, None
-        
-        # Contar ocurrencias
-        ranks = [d[0] for d in self.detection_history]
-        suits = [d[1] for d in self.detection_history]
-        
-        rank_counter = Counter(ranks)
-        suit_counter = Counter(suits)
-        
-        most_common_rank = rank_counter.most_common(1)[0][0]
-        most_common_suit = suit_counter.most_common(1)[0][0]
-        
-        # Solo retornar si hay consenso (al menos 3/5)
-        if rank_counter[most_common_rank] >= 3 and suit_counter[most_common_suit] >= 3:
-            return most_common_rank, most_common_suit
-        
+        ranks = [r for r,_ in dq]
+        suits = [s for _,s in dq]
+        r_cnt = Counter(ranks).most_common(1)[0]
+        s_cnt = Counter(suits).most_common(1)[0]
+        if r_cnt[1] >= self.stable_threshold and s_cnt[1] >= self.stable_threshold:
+            return r_cnt[0], s_cnt[0]
         return None, None
-    
-    def process_frame(self, frame):
+
+    def process_frame_multi(self, frame):
         """
-        Procesa un frame - VERSIÓN OPTIMIZADA sin delay
+        Procesa el frame y detecta múltiples cartas.
+        Devuelve:
+          frame_annotated,
+          detecciones = [ { 'key':key, 'rank':r, 'suit':s, 'stable':bool,
+                            'scores':(rank_score,suit_score), 'contour':approx } ]
         """
-        try:
-            # Convertir BGR a RGB directamente (sin denoising que causa delay)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Detectar carta con procesamiento mínimo
-            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-            
-            # Umbralización simple y rápida
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            card_contour, area = find_card_contour_from_binary(binary, min_area=self.min_card_area)
-            
-            if card_contour is None:
-                return frame, None, None, None
-            
-            # Transformar perspectiva
-            warped = four_point_transform(frame_rgb, card_contour, width=300, height=420)
+        annotated = frame.copy()
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Obtener TODOS los contornos candidatos
+        candidates = find_all_card_contours_from_binary(binary, min_area=self.min_card_area)
+        detections = []
+
+        for approx, area in candidates:
+            # Obtener key para estabilización
+            key = self._cell_key(approx)
+            # Warp
+            warped = four_point_transform(frame_rgb, approx, width=300, height=420)
             corner = extract_top_left_corner(warped)
-            thresh_corner, symbols = extract_symbols_from_corner(corner)
-            
+            _, symbols = extract_symbols_from_corner(corner)
+
             if len(symbols) < 2:
-                cv2.drawContours(frame, [card_contour], -1, (0, 255, 255), 3)
-                return frame, None, None, None
-            
-            # Clasificar rank y suit
-            potential_rank = symbols[0]
-            potential_suit = symbols[1]
-            
-            rank_match, rank_score = enhanced_rank_classification(potential_rank, self.rank_templates)
+                # Dibujar contorno en amarillo (insuficientes símbolos)
+                cv2.drawContours(annotated, [approx], -1, (0, 255, 255), 2)
+                continue
+
+            rank_sym = symbols[0]
+            suit_sym = symbols[1]
+
+            rank_match, rank_score = enhanced_rank_classification(rank_sym, self.rank_templates)
             suit_match, suit_score, _ = classify_suit_v7(
-                potential_suit, corner, self.suit_templates, self.suit_color_prototypes
+                suit_sym, corner, self.suit_templates, self.suit_color_prototypes
             )
-            
-            # Umbrales para cámara en vivo
+
+            # Filtro mínimo
             if rank_score < 0.25 or suit_score < 0.25:
-                cv2.drawContours(frame, [card_contour], -1, (0, 255, 255), 3)
-                return frame, None, None, None
-            
-            # Estabilizar detección
-            stable_rank, stable_suit = self.stabilize_detection(rank_match, suit_match)
-            
-            # Dibujar contorno
-            if stable_rank and stable_suit:
-                cv2.drawContours(frame, [card_contour], -1, (0, 255, 0), 3)
-            else:
-                cv2.drawContours(frame, [card_contour], -1, (255, 255, 0), 3)
-            
-            return frame, stable_rank, stable_suit, (rank_score, suit_score)
-            
-        except Exception as e:
-            print(f"Error procesando frame: {e}")
-            return frame, None, None, None
-    
-    def draw_info_panel(self, frame, rank, suit, scores, fps):
-        """
-        Dibuja panel de información en el frame
-        """
+                cv2.drawContours(annotated, [approx], -1, (0, 255, 255), 2)
+                continue
+
+            # Actualizar historial
+            self._update_history(key, rank_match, suit_match)
+            stable_rank, stable_suit = self._stable_vote(key)
+
+            stable = (stable_rank is not None and stable_suit is not None)
+            final_rank = stable_rank if stable else rank_match
+            final_suit = stable_suit if stable else suit_match
+
+            # Color del contorno
+            color = (0, 255, 0) if stable else (255, 255, 0)
+            cv2.drawContours(annotated, [approx], -1, color, 3)
+
+            # Texto
+            x,y,wc,hc = cv2.boundingRect(approx)
+            label = f"{final_rank} {final_suit}"
+            cv2.rectangle(annotated, (x, y-25), (x+wc, y), (0,0,0), -1)
+            cv2.putText(annotated, label, (x+5, y-7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0) if stable else (0,255,255), 1)
+
+            # Guardar warp para posible captura
+            if key is not None:
+                self.last_warps[key] = warped
+
+            detections.append({
+                "key": key,
+                "rank": final_rank,
+                "suit": final_suit,
+                "stable": stable,
+                "scores": (rank_score, suit_score),
+                "contour": approx
+            })
+
+        return annotated, detections
+
+    def draw_info_panel_multi(self, frame, detections, fps):
         h, w = frame.shape[:2]
-        
-        # Panel semi-transparente en la parte superior
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 150), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-        
-        # FPS
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        
-        # Estado
-        status_color = (0, 255, 0) if rank and suit else (0, 0, 255)
-        status_text = "DETECTANDO..." if rank and suit else "Buscando carta..."
-        cv2.putText(frame, status_text, (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-        
-        # Detección actual
-        if rank and suit and scores:
-            text = f"{rank} de {suit}"
-            cv2.putText(frame, text, (10, 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-            cv2.putText(frame, f"Confianza: R={scores[0]:.2f} S={scores[1]:.2f}",
-                       (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # Instrucciones en la parte inferior
+        cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+        cv2.putText(frame, f"Cartas detectadas: {len(detections)}", (10, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        # Panel lateral (opcional)
+        panel_w = 260
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2, (w - panel_w, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay2, 0.25, frame, 0.75, 0, frame)
+
+        y0 = 80
+        cv2.putText(frame, "DETALLES:", (w - panel_w + 10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        for i, det in enumerate(detections[:12]):  # limitar listado
+            txt = f"{i+1}. {det['rank']} {det['suit']} {'(S)' if det['stable'] else ''}"
+            cv2.putText(frame, txt, (w - panel_w + 10, y0 + i*25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0,255,0) if det["stable"] else (0,255,255), 1)
+
+        # Instrucciones abajo
         instructions = [
-            "Q: Salir | C: Capturar | R: Reiniciar | ESPACIO: Pausa/Reanudar",
-            "A: Ajustar umbral area (+) | Z: Ajustar umbral area (-)"
+            "Q: Salir | C: Capturar todas | R: Reiniciar historial",
+            "ESPACIO: Pausa | A/Z: Ajustar área mínima"
         ]
-        
-        y_offset = h - 60
         for i, inst in enumerate(instructions):
-            cv2.putText(frame, inst, (10, y_offset + i*30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
+            cv2.putText(frame, inst, (10, h - 40 + i*18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+
     def run(self):
-        """
-        Loop principal de detección en vivo
-        """
-        print("\n" + "="*60)
-        print("MODO DETECCIÓN EN VIVO - DroidCam")
-        print("="*60)
-        print("\nControles:")
-        print("  Q - Salir")
-        print("  C - Capturar y guardar carta detectada")
-        print("  R - Reiniciar historial de detección")
-        print("  ESPACIO - Pausar/Reanudar")
-        print("  A - Aumentar umbral mínimo de área")
-        print("  Z - Disminuir umbral mínimo de área")
-        print(f"\nÁrea mínima actual: {self.min_card_area}")
-        print("\n¡Apunta la cámara a una carta!\n")
-        
+        print("\n=== MODO MULTI-CARTA EN VIVO ===")
+        print("Controles: Q=Salir  C=Capturar  R=Reset  ESPACIO=Pausa  A/Z=Area +/-")
+        print(f"Área mínima inicial: {self.min_card_area}")
+
         frame_count = 0
         fps_time = time.time()
         fps = 0
-        
+
         while True:
             if not self.paused:
                 ret, frame = self.cap.read()
                 if not ret:
-                    print("Error: No se pudo leer el frame de la cámara")
-                    print("Verifica que DroidCam siga corriendo")
-                    time.sleep(1)
+                    print("Frame inválido, revisa la cámara")
+                    time.sleep(0.5)
                     continue
-                
                 self.last_frame = frame.copy()
-                
-                # Procesar frame
-                processed_frame, rank, suit, scores = self.process_frame(frame)
-                
-                # Calcular FPS cada 30 frames
+
+                annotated, detections = self.process_frame_multi(frame)
                 frame_count += 1
                 if frame_count % 30 == 0:
-                    current_time = time.time()
-                    fps = 30 / (current_time - fps_time)
-                    fps_time = current_time
-                
-                # Dibujar información
-                self.draw_info_panel(processed_frame, rank, suit, scores, fps)
-                
-                # Anunciar detección nueva
-                if rank and suit and scores:
-                    current_time = time.time()
-                    
-                    # Verificar cooldown
-                    if current_time - self.last_detection_time > self.detection_cooldown:
-                        if (rank, suit) != self.last_detection:
-                            print(f"\n✓ CARTA DETECTADA: {rank} de {suit}")
-                            print(f"  Confianza: Rank={scores[0]:.2f}, Suit={scores[1]:.2f}")
-                            self.last_detection = (rank, suit)
-                            self.last_detection_time = current_time
-                
-                display_frame = processed_frame
+                    now = time.time()
+                    fps = 30 / (now - fps_time)
+                    fps_time = now
+
+                # Anunciar nuevas cartas estables
+                now = time.time()
+                for det in detections:
+                    if det["stable"]:
+                        key = det["key"]
+                        if key is None:
+                            continue
+                        card_id = (det["rank"], det["suit"], key)
+                        if (now - self.last_announce_time > self.detection_cooldown and
+                            card_id not in self.last_announced_cards):
+                            print(f"✓ Carta estable: {det['rank']} de {det['suit']} (scores R={det['scores'][0]:.2f}, S={det['scores'][1]:.2f})")
+                            self.last_announced_cards.add(card_id)
+                            self.last_announce_time = now
+
+                self.draw_info_panel_multi(annotated, detections, fps)
+                display = annotated
             else:
-                # Modo pausado
-                display_frame = self.last_frame.copy() if self.last_frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(display_frame, "PAUSADO - Presiona ESPACIO para continuar", 
-                           (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            
-            # Mostrar frame
-            cv2.imshow('Deteccion de Cartas - DroidCam', display_frame)
-            
-            # Manejar teclas
+                display = self.last_frame.copy() if self.last_frame is not None else np.zeros((480,640,3), dtype=np.uint8)
+                cv2.putText(display, "PAUSADO - ESPACIO para continuar",
+                            (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+
+            cv2.imshow("Deteccion Multi-Carta", display)
             key = cv2.waitKey(1) & 0xFF
-            
-            if key == ord('q') or key == ord('Q'):
-                print("\nSaliendo...")
+
+            if key in (ord('q'), ord('Q')):
+                print("Saliendo...")
                 break
-            elif key == ord('c') or key == ord('C'):
-                if rank and suit:
-                    # Guardar captura
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    filename = f"captured_{rank}_{suit}_{timestamp}.jpg"
-                    filepath = os.path.join("content", filename)
-                    cv2.imwrite(filepath, self.last_frame)
-                    print(f"✓ Captura guardada: {filename}")
-                else:
-                    print("⚠ No hay carta detectada para capturar")
-            elif key == ord('r') or key == ord('R'):
-                # Reiniciar historial
-                self.detection_history.clear()
-                self.last_detection = None
-                print("✓ Historial de detección reiniciado")
-            elif key == ord(' '):
-                # Pausar/Reanudar
+            elif key in (ord(' '),):
                 self.paused = not self.paused
-                print("⏸ PAUSADO" if self.paused else "▶ REANUDADO")
-            elif key == ord('a') or key == ord('A'):
-                # Aumentar umbral de área
+                print("Pausado" if self.paused else "Reanudado")
+            elif key in (ord('r'), ord('R')):
+                self.per_card_histories.clear()
+                self.last_announced_cards.clear()
+                print("Historial reiniciado.")
+            elif key in (ord('a'), ord('A')):
                 self.min_card_area += 5000
-                print(f"✓ Área mínima: {self.min_card_area}")
-            elif key == ord('z') or key == ord('Z'):
-                # Disminuir umbral de área
-                self.min_card_area = max(10000, self.min_card_area - 5000)
-                print(f"✓ Área mínima: {self.min_card_area}")
-        
-        # Limpiar
+                print(f"Área mínima ahora: {self.min_card_area}")
+            elif key in (ord('z'), ord('Z')):
+                self.min_card_area = max(8000, self.min_card_area - 5000)
+                print(f"Área mínima ahora: {self.min_card_area}")
+            elif key in (ord('c'), ord('C')):
+                # Capturar warps de cartas estables
+                stable_warps = [ (k, self.last_warps[k]) for k in self.last_warps if self._stable_vote(k)[0] ]
+                if not stable_warps:
+                    print("No hay cartas estables para capturar.")
+                else:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    os.makedirs("captures", exist_ok=True)
+                    for idx,(k,warp) in enumerate(stable_warps, start=1):
+                        rank, suit = self._stable_vote(k)
+                        fname = f"captures/card_{rank}_{suit}_{ts}_{idx}.jpg"
+                        cv2.imwrite(fname, cv2.cvtColor(warp, cv2.COLOR_RGB2BGR))
+                        print(f"Capturada: {fname}")
+
         self.cap.release()
         cv2.destroyAllWindows()
-        print("\n✓ Detección en vivo finalizada")
+        print("Fin detección multi-carta.")

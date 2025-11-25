@@ -128,6 +128,35 @@ def find_card_contour_from_binary(binary, min_area=10000):
             best = approx
     return best, max_area
 
+
+def find_all_card_contours_from_binary(binary, min_area=10000):
+    """
+    Encuentra TODOS los contornos que parezcan cartas (polígonos de 4 puntos con área suficiente).
+    Devuelve lista de (approx_contour, area).
+    """
+    contours, _ = find_contours(binary)
+    candidates = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        eps = 0.02 * cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, eps, True)
+        if len(approx) != 4:
+            continue
+        # Validar razón de aspecto (altura/ancho) aproximada de una carta
+        x,y,w,h = cv2.boundingRect(approx)
+        if w == 0 or h == 0:
+            continue
+        ratio = h / w
+        # Cartas verticales ~1.3–1.5, horizontales ~0.65–0.75 (permitimos rango más amplio)
+        if not (0.55 <= ratio <= 1.9):
+            continue
+        candidates.append((approx, area))
+    # Opcional: ordenar por área (mayor a menor)
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates
+
 def four_point_transform(image_rgb, pts, width=300, height=420):
     """
     Aplica transformación perspectiva asegurando que la carta quede en orientación vertical
