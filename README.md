@@ -3,19 +3,61 @@
 ## Índice
 
 1. [Resumen](#resumen)
-2. [Hardware](#hardware)
+2. [Estructura del Proyecto](#estructura)
+3. [Hardware](#hardware)
     - [Requisitos y justificación](#requisitos-hardware)
     - [Especificaciones técnicas](#especificaciones-hardware)
     - [Diagrama del montaje](#diagrama-montaje)
-3. [Software](#software)
+4. [Software](#software)
     - [Requisitos y justificación](#requisitos-software)
     - [Especificaciones técnicas](#especificaciones-software)
-4. [Hoja de Ruta de Desarrollo](#hoja-de-ruta)
-5. [Solución](#solucion)
+5. [Hoja de Ruta de Desarrollo](#hoja-de-ruta)
+6. [Solución](#solucion)
     - [Diagrama de Decisión](#diagrama-decision)
     - [Secuencialización de Operaciones](#secuencializacion)
     - [Explicación de las funcionalidades principales](#funcionalidades)
-6. [Otras Tareas Realizadas](#otras-tareas)
+7. [Otras Tareas Realizadas](#otras-tareas)
+
+---
+
+<a name="estructura"></a>
+## 2. Estructura del Proyecto
+
+```
+DetectorCartas/
+│
+├── main.py                      # Script principal - punto de entrada
+├── live_detector.py             # Detector en tiempo real con interfaz visual
+├── requirements.txt             # Dependencias del proyecto
+├── README.md                    # Este archivo
+├── .gitignore                   # Archivos ignorados por git
+│
+├── modules/                     # Módulos principales del sistema
+│   ├── __init__.py             # Inicialización del paquete
+│   ├── card_detection.py       # Detección y extracción de cartas
+│   ├── image_processing.py     # Procesamiento básico de imágenes
+│   ├── symbol_extraction.py    # Extracción de símbolos de esquinas
+│   ├── rank_classifier.py      # Clasificación de números/letras
+│   ├── suit_classifier.py      # Clasificación de palos
+│   ├── suit_features.py        # Características específicas por palo
+│   ├── template_builder.py     # Construcción de plantillas
+│   └── visualization.py        # Funciones de visualización
+│
+├── template/                    # Directorio de plantillas (gitignored)
+│   ├── corazones/              # Plantillas de corazones
+│   ├── diamantes/              # Plantillas de diamantes
+│   ├── picas/                  # Plantillas de picas
+│   └── treboles/               # Plantillas de tréboles
+│
+├── content/                     # Imágenes de prueba (gitignored)
+│   └── *.jpg                   # Imágenes de cartas para procesamiento
+│
+├── captures/                    # Capturas del detector en vivo
+│   └── *.jpg                   # Imágenes capturadas durante detección
+└── __pycache__/                # Cache de Python (gitignored)
+│
+└── venv/                       # Entorno virtual con dependencias instaladas localmente 
+```
 
 ---
 
