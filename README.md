@@ -23,7 +23,7 @@
 <a name="resumen"></a>
 ## 1. Resumen
 
-Sistema modular para el reconocimiento automático de cartas de baraja española/inglesa a través de visión por computadora. Capaz de procesar imágenes estáticas y video en tiempo real utilizando plantillas optimizadas y extracción robusta de características.
+Sistema modular para el reconocimiento automático de cartas de baraja inglesa a través de visión por computadora. Capaz de procesar imágenes estáticas y video en tiempo real utilizando plantillas optimizadas y extracción robusta de características.
 
 ---
 
