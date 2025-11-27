@@ -262,12 +262,6 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
 
 ---
 
-## Gráfico de precisión (simulado)
-
-![Gráfico de Precisión](https://dummyimage.com/600x200/eeeeee/444444.png&text=Precisión+Reconocimiento+por+Tipo+de+Carta)
-
----
-
 ## Conclusión
 
 El sistema logra un procesado robusto y flexible con adaptación a diferentes montajes físicos y variabilidad de condiciones lumínicas. La modularización facilita el ajuste y la extensión futura del pipeline.
