@@ -20,6 +20,13 @@
 
 ---
 
+<a name="resumen"></a>
+## 1. Resumen
+
+Sistema modular para el reconocimiento automático de cartas de baraja española/inglesa a través de visión por computadora. Capaz de procesar imágenes estáticas y video en tiempo real utilizando plantillas optimizadas y extracción robusta de características.
+
+---
+
 <a name="estructura"></a>
 ## 2. Estructura del Proyecto
 
@@ -61,15 +68,8 @@ DetectorCartas/
 
 ---
 
-<a name="resumen"></a>
-## 1. Resumen
-
-Sistema modular para el reconocimiento automático de cartas de baraja española/inglesa a través de visión por computadora. Capaz de procesar imágenes estáticas y video en tiempo real utilizando plantillas optimizadas y extracción robusta de características.
-
----
-
 <a name="hardware"></a>
-## 2. Hardware
+## 3. Hardware
 
 <a name="requisitos-hardware"></a>
 ### Requisitos y Justificación
@@ -112,7 +112,7 @@ graph TD
 ---
 
 <a name="software"></a>
-## 3. Software
+## 4. Software
 
 <a name="requisitos-software"></a>
 ### Requisitos y Justificación
@@ -140,7 +140,7 @@ graph TD
 ---
 
 <a name="hoja-de-ruta"></a>
-## 4. Hoja de Ruta del Desarrollo
+## 5. Hoja de Ruta del Desarrollo
 
 1. **Definición del problema**: Procesamiento y reconocimiento de cartas usando visión artificial.
 2. **Selección y prueba de hardware/software**: Verificación de calidad de capturas, conectividad y fiabilidad.
@@ -167,7 +167,7 @@ graph TD
 ---
 
 <a name="solucion"></a>
-## 5. Solución
+## 6. Solución
 
 <a name="diagrama-decision"></a>
 ### Diagrama de Decisión – Clasificación de Cartas
@@ -279,7 +279,7 @@ def classify_suit_v7(suit_symbol_binary, corner_rgb, suit_templates, suit_color_
 ---
 
 <a name="otras-tareas"></a>
-## 6. Otras Tareas Realizadas
+## 7. Otras Tareas Realizadas
 
 - **Desarrollo de script para reconocimiento en vivo** (live_detector.py)
     - Interfaz visual minimalista, estabilización de resultados por buffer/history.
